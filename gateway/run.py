@@ -20370,7 +20370,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         makes interactive latency independent of batch backlog. Disabled
         (default) = single shared pool, byte-identical to prior behavior.
         """
-        workers = getattr(self.config, "interactive_executor_workers", None) or 0
+        config = getattr(self, "config", None)
+        workers = getattr(config, "interactive_executor_workers", None) or 0
         if workers <= 0:
             return self._get_executor()
 
@@ -20410,7 +20411,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return True
         except Exception:
             return True
-        return platform in ("webhook",)
+        # Only known human-driven chat surfaces may use reserved capacity.
+        # Callback listeners, API/webhook routes, automation surfaces, plugins,
+        # and unknown values stay on the shared pool so they cannot starve a
+        # person waiting in an interactive chat.
+        interactive_platforms = frozenset({
+            "local",
+            "telegram",
+            "discord",
+            "whatsapp",
+            "slack",
+            "signal",
+            "mattermost",
+            "matrix",
+            "dingtalk",
+            "wecom",
+            "weixin",
+            "qqbot",
+            "yuanbao",
+        })
+        return platform not in interactive_platforms
 
     def _shutdown_executor(self) -> None:
         """Stop the gateway-owned executor without touching the loop default."""

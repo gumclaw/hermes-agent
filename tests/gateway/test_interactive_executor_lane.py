@@ -61,6 +61,15 @@ def test_lane_off_when_config_attribute_missing():
         _cleanup(runner)
 
 
+def test_lane_off_when_runner_has_no_config_object():
+    runner = _make_runner()
+    del runner.config
+    try:
+        assert runner._get_interactive_executor() is runner._get_executor()
+    finally:
+        _cleanup(runner)
+
+
 # ----------------------------------------------------------------- lane on
 
 def test_lane_on_creates_separate_pool():
@@ -96,8 +105,16 @@ def _src(platform):
 
 def test_platform_routing():
     from gateway.run import GatewayRunner
-    assert GatewayRunner._is_batch_platform(_src("webhook")) is True
-    for p in ("telegram", "discord", "slack", "whatsapp", "cli"):
+    for p in (
+        "webhook", "api_server", "msgraph_webhook", "wecom_callback",
+        "whatsapp_cloud", "sms", "email", "homeassistant", "relay", "unknown",
+    ):
+        assert GatewayRunner._is_batch_platform(_src(p)) is True
+    for p in (
+        "local", "telegram", "discord", "slack", "whatsapp", "signal",
+        "mattermost", "matrix", "dingtalk", "wecom", "weixin", "qqbot",
+        "yuanbao",
+    ):
         assert GatewayRunner._is_batch_platform(_src(p)) is False
     # plain-string platform attribute (no .value)
     assert GatewayRunner._is_batch_platform(
