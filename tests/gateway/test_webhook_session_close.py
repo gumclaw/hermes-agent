@@ -214,7 +214,7 @@ async def test_end_webhook_session_awaits_async_session_db(tmp_path):
 
 @pytest.mark.asyncio
 async def test_restart_cancelled_webhook_run_stays_recoverable(tmp_path):
-    """A run cancelled by a restart drain must NOT be closed.
+    """A run cancelled by a restart drain must NOT be marked complete.
 
     Counterpart invariant to the ghost-leak tests above, and the reason the
     CANCELLED outcome is carved out.  A gateway restart drains in-flight work
@@ -287,3 +287,75 @@ async def test_restart_cancelled_webhook_run_stays_recoverable(tmp_path):
     )
     assert recovered["id"] == session_id
     store._db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True], ids=["abandoned", "reconstructed"])
+async def test_cancelled_webhook_retention_without_route_revisit(tmp_path, monkeypatch, resume):
+    """Cancellation preserves work before retention, but cannot leak forever."""
+    from gateway.platforms.base import ProcessingOutcome
+
+    # SessionDB's default path is captured at import time. Isolate this case
+    # from the author's other sessions while retaining real SQLite imports.
+    monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", tmp_path / "state.db")
+    store = _make_store(tmp_path)
+    adapter = _make_adapter(
+        {"alerts": {"secret": _INSECURE_NO_AUTH, "prompt": "x", "deliver": "log"}}
+    )
+    adapter.gateway_runner = _FakeRunner(store)
+    # Log-only webhook delivery has no platform typing surface. Keep this
+    # retention test focused on the processing task whose lifetime it owns.
+    adapter.config.typing_indicator = False
+    try:
+        started = asyncio.Event()
+        created = {}
+        transcript = [
+            {"role": "user", "content": "Investigate ticket #42: café\nOriginal payload", "timestamp": 1700000000.0},
+            {"role": "assistant", "content": "Checked the logs; investigation unfinished.", "timestamp": 1700000001.0},
+        ]
+
+        async def interrupted(event):
+            entry = store.get_or_create_session(event.source)
+            created["id"] = entry.session_id
+            store._db.replace_messages(entry.session_id, transcript)
+            started.set()
+            await asyncio.Event().wait()
+
+        adapter._message_handler = interrupted
+        event = _make_event(adapter, "retention-unique-delivery", "original payload")
+        await adapter.handle_message(event)
+        await asyncio.wait_for(started.wait(), timeout=5)
+        await adapter.cancel_background_tasks()
+        await adapter.cancel_background_tasks()  # duplicate drain is harmless
+        session_id = created["id"]
+        row = store._db.get_session(session_id)
+        assert store._db.prune_sessions(older_than_days=30, source="webhook") == 0
+        assert store.load_transcript(session_id) == transcript
+
+        if resume:
+            # A fresh routing namespace has neither the SQLite routing entry nor
+            # sessions.json, but shares the real temporary HERMES_HOME/state.db.
+            store._db.close()
+            restart_dir = tmp_path / "restart"
+            restart_dir.mkdir()
+            store = _make_store(restart_dir)
+            recovered = store.get_or_create_session(event.source)
+            assert recovered.session_id == session_id
+            assert store.load_transcript(recovered.session_id) == transcript
+            assert store._db.get_session(session_id)["ended_at"] is None
+            adapter.gateway_runner = _FakeRunner(store)
+            # Simulate the recovered run ending at a subsequent drain.
+            await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
+
+        # No resume or expiry lookup for the abandoned one-shot routing key.
+        # Advance only the retention clock; no wall-clock waiting or DB mutation.
+        with monkeypatch.context() as clock:
+            clock.setattr("hermes_state.time.time", lambda: row["started_at"] + 31 * 86400)
+            assert store._db.prune_sessions(older_than_days=30, source="webhook") == 1
+        assert store._db.get_session(session_id) is None
+        assert store.load_transcript(session_id) == []
+    finally:
+        try:
+            await adapter.cancel_background_tasks()
+        finally:
+            store._db.close()
